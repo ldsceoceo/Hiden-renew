@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.log
+security_page.png
+security_timeout.png
+turnstile_timeout.png
+login_fail.png
+renew_*.png
+server_id_error.png

@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os,re,sys,time,random,requests
+from datetime import datetime
 try:
     from patchright.sync_api import sync_playwright
     USING_PATCHRIGHT = True
@@ -74,7 +75,7 @@ def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
         else:
             masked_email = f"{name}@{domain}"
     else:
-        masked_email = EMAIL[:2] + '****'
+        masked_email = (EMAIL[:2] + '****') if EMAIL else 'Cookie 登录'
 
     text = (
         f"🎉 HidenCloud 续期通知\n\n"
@@ -360,6 +361,60 @@ def solve_modal_turnstile(page, timeout=90):
     log("❌ Turnstile 验证超时。")
     return False
 
+def _dismiss_cookie_banner(page):
+    """关闭 NCMP cookie 同意横幅（#ncmp__tool），它会盖住续期弹窗按钮拦截点击"""
+    try:
+        tool = page.locator('#ncmp__tool')
+        if tool.count() == 0:
+            return True
+        for text in ('Accept all', 'Accept', '同意', '接受', 'OK', 'Got it', 'Allow'):
+            try:
+                btn = tool.locator(f'button:has-text("{text}")').first
+                if btn.count() > 0 and btn.is_visible():
+                    btn.click(timeout=3000)
+                    log(f"🍪 已点击 cookie 横幅按钮（{text}）")
+                    break
+            except Exception:
+                continue
+        time.sleep(1)
+        try:
+            if tool.count() == 0 or not tool.first.is_visible():
+                log("🍪 cookie 横幅已关闭")
+                return True
+        except Exception:
+            return True
+        log("⚠️ cookie 横幅仍在，将用强制点击绕过")
+        return False
+    except Exception as e:
+        log(f"⚠️ 关闭 cookie 横幅异常（忽略）: {e}")
+        return False
+
+def _safe_click(page, locator, label, timeout=20000):
+    locator.wait_for(state="visible", timeout=timeout)
+    _dismiss_cookie_banner(page)
+    try:
+        locator.click(timeout=timeout)
+        return True
+    except Exception as e:
+        if "intercepts pointer events" not in str(e):
+            raise
+        log(f"⚠️ {label} 普通点击被浮层拦截，改用强制点击...")
+        try:
+            locator.click(timeout=5000, force=True)
+            return True
+        except Exception as e2:
+            log(f"⚠️ {label} 强制点击也失败 ({e2})，改用 JS 直接提交表单...")
+            handle = locator.element_handle(timeout=5000)
+            if not handle:
+                raise Exception("拿不到按钮句柄")
+            page.evaluate(
+                "(btn) => { const f = btn.closest('form');"
+                " if (f) { if (f.requestSubmit) f.requestSubmit(); else f.submit(); }"
+                " else btn.click(); }",
+                handle,
+            )
+            return True
+
 def open_browser(p):
     """启动浏览器，返回 (browser, page)。优先 patchright（反检测内核），未安装则退回原生 playwright。"""
     proxy_arg = {"server": PROXY_SERVER} if IS_PROXY else None
@@ -433,7 +488,7 @@ def login(page):
     try:
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page, timeout=240)
-        time.sleep(2)
+        time.sleep(8)
         
         log("⌨️ 输入账号密码...")
         # 真实表单字段：input[name="username"]（可填邮箱或用户名）/ input[name="password"]
@@ -445,6 +500,7 @@ def login(page):
         except Exception:
             handle_cloudflare(page, timeout=120)
             user_input.wait_for(state="visible", timeout=30000)
+        time.sleep(3)
         user_input.fill(EMAIL, timeout=10000)
         pwd_input.fill(PASSWORD, timeout=10000)
         time.sleep(0.5)
@@ -456,7 +512,7 @@ def login(page):
         
         log("🖱️ 点击登录按钮提交...")
         try:
-            page.click('button[type="submit"]', timeout=8000)
+            page.click('button[type="submit"]', timeout=10000)
         except Exception:
             page.locator('button:has-text("Sign in"), button:has-text("登录")').first.click(timeout=10000)
         time.sleep(3)
@@ -545,6 +601,19 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
+def parse_due_date(text):
+    """将页面显示的日期 "28 Apr 2026" 转换为 YYYY-MM-DD 格式，供 Workflow 提取更新 Cron"""
+    if not text or text == "未知":
+        return None
+    match = re.search(r'(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})', text)
+    if match:
+        day, month_str, year = match.groups()
+        try:
+            return datetime.strptime(f"{day} {month_str} {year}", "%d %b %Y").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return None
+
 def renew_service(page):
 
     try:
@@ -555,8 +624,8 @@ def renew_service(page):
 
         log("🖱️ 准备点击 Renew 按钮...")
         time.sleep(3)
-        renew_btn = page.locator('button:has-text("Renew")')
-        create_btn = page.locator('button:has-text("Create Invoice")')
+        renew_btn = page.locator('button:has-text("Renew")').first
+        create_btn = page.locator('button:has-text("Create Invoice")').first
 
         modal_opened = False
         for i in range(6):
@@ -564,7 +633,7 @@ def renew_service(page):
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                renew_btn.click()
+                _safe_click(page, renew_btn, "Renew", timeout=15000)
 
                 # 等待一小段时间，检测是否出现“未到续期时间”弹窗
                 time.sleep(3)
@@ -603,8 +672,7 @@ def renew_service(page):
         for attempt in range(6):
             log(f"🖱️ 点击 'Create Invoice'（第 {attempt + 1} 次）...")
             try:
-                create_btn.wait_for(state="visible", timeout=20000)
-                create_btn.click(timeout=20000)
+                _safe_click(page, create_btn, "Create Invoice", timeout=20000)
             except Exception as e:
                 log(f"⚠️ 点击 Create Invoice 失败: {e}")
                 solve_modal_turnstile(page, timeout=45)
@@ -638,12 +706,11 @@ def renew_service(page):
 
         log("🔎 查找 Pay 按钮...")
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
-        pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
+        _safe_click(page, pay_btn, "Pay", timeout=30000)
         log("✅ Pay 按钮已点击")
 
         # 等待支付确认页面或跳转回服务页
-        time.sleep(5)
+        time.sleep(6)
         # 返回服务管理页面以获取新的到期时间
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
@@ -664,6 +731,7 @@ def main():
 
     global SERVICE_URL
 
+    current_ip = "未知"
     with sync_playwright() as p:
         browser = None
         try:
@@ -680,12 +748,15 @@ def main():
             browser, page = open_browser(p)
 
             if not login(page):
+                log("❌ 登录失败，退出。")
+                send_telegram_notification("❌ 登录失败", "未知", "未知", current_ip)
                 sys.exit(1)
 
             # 登录成功后，自动获取 Server ID
             server_id = get_server_id(page)
             if not server_id:
                 log("❌ 无法获取 Server ID，退出。")
+                send_telegram_notification("❌ 未获取到Server ID, 检查服务是否被删除", "未知", "未知", current_ip)
                 sys.exit(1)
             SERVICE_URL = f"{BASE_URL}/service/{server_id}/manage"
 
@@ -706,7 +777,16 @@ def main():
             else:  # renew_result is True
                 new_due = get_due_date(page)
                 log(f"📆 续费后到期时间：{new_due}")
-                status = "✅ 续期成功"
+                if new_due in ("未知", old_due):
+                    log("⚠️ 续期后到期时间未变化，续期可能未生效")
+                    status = "⚠️ 续期未生效（到期时间未变化）"
+                else:
+                    status = "✅ 续期成功"
+
+            # 输出标准化到期时间，供 GitHub Actions 提取并自动更新 Cron
+            due_std = parse_due_date(new_due)
+            if due_std:
+                log(f"到期时间(标准): {due_std}")
 
             # 发送 Telegram 通知
             send_telegram_notification(status, old_due, new_due, current_ip)
@@ -719,6 +799,7 @@ def main():
                 sys.exit(0)
         except Exception as e:
             log(f"❌ 浏览器启动出错: {e}")
+            send_telegram_notification("❌ 脚本运行异常", "未知", "未知", current_ip)
             sys.exit(1)
         finally:
             if browser:
